@@ -1,0 +1,56 @@
+import type { Extension } from '@/lib/extensions/types'
+import { handleMcpRequest } from './server'
+import { isForbiddenOrigin, forbiddenOriginResponse } from './origin-guard'
+
+export const mcpServerExtension: Extension = {
+  id: 'mcp-server',
+  name: 'MCP Server',
+  version: '1.0.0',
+
+  settingsPanel: {
+    label: 'MCP-server (API)',
+    path: '/settings/api',
+  },
+
+  apiRoutes: [
+    {
+      method: 'POST',
+      path: '/mcp',
+      skipAuth: true, // Auth handled via API key in the handler
+      handler: async (request: Request) => {
+        // MCP spec MUST: validate Origin (DNS-rebinding defense). See origin-guard.ts.
+        if (isForbiddenOrigin(request)) return forbiddenOriginResponse()
+        return handleMcpRequest(request)
+      },
+    },
+    // MCP Streamable HTTP also needs GET for SSE and DELETE for session termination
+    {
+      method: 'GET',
+      path: '/mcp',
+      skipAuth: true,
+      // This server is stateless and offers no server-initiated SSE stream, so
+      // the Streamable HTTP spec requires 405 Method Not Allowed here. Returning
+      // 401 makes spec-compliant clients treat the SSE GET as an auth failure
+      // and retry-loop against the endpoint.
+      handler: async (request: Request) => {
+        if (isForbiddenOrigin(request)) return forbiddenOriginResponse()
+        return new Response('Method Not Allowed', {
+          status: 405,
+          headers: { Allow: 'POST, DELETE' },
+        })
+      },
+    },
+    {
+      method: 'DELETE',
+      path: '/mcp',
+      skipAuth: true,
+      // Stateless: no sessions to terminate
+      handler: async (request: Request) => {
+        if (isForbiddenOrigin(request)) return forbiddenOriginResponse()
+        return new Response(null, { status: 204 })
+      },
+    },
+  ],
+
+  eventHandlers: [],
+}

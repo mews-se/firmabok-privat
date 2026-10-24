@@ -1,0 +1,217 @@
+import type { McpResource } from './types'
+import { ACTION_NEEDED_THRESHOLD_DAYS } from '@/lib/deadlines/status-engine'
+
+type Severity = 'critical' | 'warning' | 'info'
+
+interface AttentionCategory {
+  key: string
+  label_sv: string
+  severity: Severity
+  count: number
+  samples: Array<Record<string, unknown>>
+  next?: {
+    description: string
+    tool?: string
+    args?: Record<string, unknown>
+    resource?: string
+  }
+}
+
+const SAMPLE_LIMIT = 5
+
+function daysBetween(fromIso: string, toIso: string): number {
+  const ms = new Date(toIso).getTime() - new Date(fromIso).getTime()
+  return Math.round(ms / 86_400_000)
+}
+
+export const attentionResource: McpResource = {
+  uri: 'Accounted://attention',
+  name: 'What Needs Attention',
+  description:
+    'One-shot summary of outstanding work for the active company: overdue invoices, pending approvals, upcoming deadlines, and period-lock alerts. Each category includes a count, up to 5 sample rows, and a suggested next tool call. Use this at session start to orient before chaining read tools.',
+  mimeType: 'application/json',
+  read: async ({ supabase, companyId }) => {
+    const now = new Date()
+    const today = now.toISOString().slice(0, 10)
+    const horizonDate = new Date(now.getTime() + ACTION_NEEDED_THRESHOLD_DAYS * 86_400_000)
+    const horizon = horizonDate.toISOString().slice(0, 10)
+
+    const [
+      overdueRows,
+      pendingSupplierHead,
+      pendingSupplierSamples,
+      pendingOpsHead,
+      pendingOpsSamples,
+      deadlineRows,
+      activePeriodRow,
+      companySettingsRow,
+    ] = await Promise.all([
+      supabase
+        .from('invoices')
+        .select('id, invoice_number, customer_id, due_date, total, currency, status')
+        .eq('company_id', companyId)
+        .in('status', ['sent', 'overdue'])
+        .lt('due_date', today)
+        .order('due_date', { ascending: true })
+        .limit(100),
+      supabase
+        .from('supplier_invoices')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId)
+        .eq('status', 'registered'),
+      supabase
+        .from('supplier_invoices')
+        .select('id, supplier_invoice_number, supplier_id, total, currency, due_date')
+        .eq('company_id', companyId)
+        .eq('status', 'registered')
+        .order('due_date', { ascending: true })
+        .limit(SAMPLE_LIMIT),
+      supabase
+        .from('pending_operations')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId)
+        .eq('status', 'pending'),
+      supabase
+        .from('pending_operations')
+        .select('id, operation_type, title, risk_level, actor_label, created_at')
+        .eq('company_id', companyId)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(SAMPLE_LIMIT),
+      supabase
+        .from('deadlines')
+        .select('id, title, due_date, deadline_type, tax_deadline_type, status')
+        .eq('company_id', companyId)
+        .eq('is_completed', false)
+        .lte('due_date', horizon)
+        .order('due_date', { ascending: true })
+        .limit(20),
+      supabase
+        .from('fiscal_periods')
+        .select('id, name, period_start, period_end, locked_at, is_closed')
+        .eq('company_id', companyId)
+        .lte('period_start', today)
+        .gte('period_end', today)
+        .maybeSingle(),
+      supabase
+        .from('company_settings')
+        .select('bookkeeping_locked_through, auto_lock_period_days')
+        .eq('company_id', companyId)
+        .maybeSingle(),
+    ])
+
+    const categories: AttentionCategory[] = []
+
+    // ── Overdue invoices ────────────────────────────────────────────
+    const overdueAll = overdueRows.data ?? []
+    if (overdueAll.length > 0) {
+      const maxOverdueDays = overdueAll.reduce((max, inv) => {
+        const days = inv.due_date ? daysBetween(inv.due_date, today) : 0
+        return Math.max(max, days)
+      }, 0)
+      categories.push({
+        key: 'overdue_invoices',
+        label_sv: 'Förfallna fakturor',
+        severity: maxOverdueDays > 30 ? 'critical' : 'warning',
+        count: overdueAll.length,
+        samples: overdueAll.slice(0, SAMPLE_LIMIT),
+        next: {
+          description: 'Granska förfallna fakturor.',
+          resource: 'Accounted://recent-activity?limit=20',
+        },
+      })
+    }
+
+    // ── Pending supplier invoices (status='registered') ─────────────
+    const pendingSupplierCount = pendingSupplierHead.count ?? 0
+    if (pendingSupplierCount > 0) {
+      const oldestRegistered = pendingSupplierSamples.data?.[0]
+      categories.push({
+        key: 'pending_supplier_invoices',
+        label_sv: 'Leverantörsfakturor som väntar på godkännande',
+        severity: 'warning',
+        count: pendingSupplierCount,
+        samples: pendingSupplierSamples.data ?? [],
+        next: {
+          description: 'Godkänn äldsta registrerade leverantörsfakturan.',
+          tool: 'gnubok_approve_supplier_invoice',
+          args: oldestRegistered ? { supplier_invoice_id: oldestRegistered.id } : undefined,
+        },
+      })
+    }
+
+    // ── Pending operations awaiting approval ────────────────────────
+    const pendingOpsCount = pendingOpsHead.count ?? 0
+    if (pendingOpsCount > 0) {
+      const ops = pendingOpsSamples.data ?? []
+      const hasHighRisk = ops.some((o) => o.risk_level === 'high')
+      categories.push({
+        key: 'pending_operations',
+        label_sv: 'Operationer som väntar på godkännande',
+        severity: hasHighRisk ? 'critical' : 'warning',
+        count: pendingOpsCount,
+        samples: ops,
+        next: {
+          description:
+            'Visa kön för användaren. När användaren godkänner en specifik operation_id i chatten, anropa gnubok_approve_pending_operation direkt: /pending är ett alternativ, inte ett krav.',
+          tool: 'gnubok_list_pending_operations',
+        },
+      })
+    }
+
+    // ── Deadlines upcoming (within 14 days) ─────────────────────────
+    const deadlines = deadlineRows.data ?? []
+    if (deadlines.length > 0) {
+      const anyOverdue = deadlines.some((d) => d.due_date && d.due_date < today)
+      categories.push({
+        key: 'deadlines_upcoming',
+        label_sv: 'Deadlines inom 14 dagar',
+        severity: anyOverdue ? 'critical' : 'warning',
+        count: deadlines.length,
+        samples: deadlines.slice(0, SAMPLE_LIMIT),
+        next: {
+          description: 'Granska kommande deadlines i /deadlines.',
+        },
+      })
+    }
+
+    // ── Period lock approaching ─────────────────────────────────────
+    const lockDate = companySettingsRow.data?.bookkeeping_locked_through ?? null
+    if (lockDate && activePeriodRow.data) {
+      const daysUntilLock = daysBetween(today, lockDate)
+      if (daysUntilLock >= 0 && daysUntilLock <= ACTION_NEEDED_THRESHOLD_DAYS) {
+        categories.push({
+          key: 'period_lock_approaching',
+          label_sv: 'Bokföringslås närmar sig',
+          severity: 'info',
+          count: 1,
+          samples: [
+            {
+              lock_date: lockDate,
+              days_until: daysUntilLock,
+              active_period_id: activePeriodRow.data.id,
+            },
+          ],
+          next: {
+            description: 'Slutför obokfört arbete innan lock_date.',
+            resource: 'Accounted://period/active',
+          },
+        })
+      }
+    }
+
+    // ── Summary tally ───────────────────────────────────────────────
+    const summary = {
+      total_items: categories.reduce((sum, c) => sum + c.count, 0),
+      critical: categories.filter((c) => c.severity === 'critical').length,
+      warning: categories.filter((c) => c.severity === 'warning').length,
+      info: categories.filter((c) => c.severity === 'info').length,
+    }
+
+    return {
+      generated_at: now.toISOString(),
+      summary,
+      categories,
+    }
+  },
+}

@@ -1,0 +1,597 @@
+'use client'
+
+import { useState, useEffect, useMemo } from 'react'
+import { useTranslations } from 'next-intl'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Badge } from '@/components/ui/badge'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
+import { useToast } from '@/components/ui/use-toast'
+import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
+import LinkVoucherPicker from '@/components/invoices/LinkVoucherPicker'
+import { proposePaymentLines, resolveInvoicePaymentSourceType } from '@/lib/bookkeeping/propose-payment-lines'
+import { planCashInstalment } from '@/lib/bookkeeping/cash-instalment'
+import { getErrorMessage } from '@/lib/errors/get-error-message'
+import { getDisplayTotal } from '@/lib/invoices/rounding'
+import { hasRotRutDeduction } from '@/lib/invoices/rot-rut-rules'
+import { roundOre } from '@/lib/money'
+import { formatCurrency } from '@/lib/utils'
+import { createClient } from '@/lib/supabase/client'
+import { useCompany } from '@/contexts/CompanyContext'
+import { Plus, Trash2, Loader2 } from 'lucide-react'
+import type { FormLine } from '@/components/bookkeeping/JournalEntryForm'
+import type { Invoice, InvoiceItem, Customer, BASAccount, EntityType } from '@/types'
+import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
+
+interface InvoiceWithRelations extends Invoice {
+  customer: Customer
+  items: InvoiceItem[]
+  // Present once an issuance verifikat has been booked (faktureringsmetoden);
+  // absent on kontantmetoden invoices that recognise revenue at payment.
+  journal_entry_id?: string | null
+}
+
+interface PaymentBookingDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  invoice: InvoiceWithRelations
+  onSuccess: () => void
+}
+
+const BLANK_LINE: FormLine = { account_number: '', debit_amount: '', credit_amount: '', line_description: '' }
+
+interface ProposalSettings {
+  entityType: EntityType
+  companyOreRounding?: boolean
+}
+
+export default function PaymentBookingDialog({
+  open,
+  onOpenChange,
+  invoice,
+  onSuccess,
+}: PaymentBookingDialogProps) {
+  const { toast } = useToast()
+  const supabase = createClient()
+  const { company } = useCompany()
+  const t = useTranslations('invoice_payment_dialog')
+
+  const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const [catalog, setCatalog] = useState<CatalogAccount[]>([])
+  const [lines, setLines] = useState<FormLine[]>([])
+  const accountNameByNumber = useMemo(() => {
+    const names = new Map(catalog.map((account) => [account.account_number, account.account_name]))
+    for (const account of accounts) names.set(account.account_number, account.account_name)
+    return names
+  }, [accounts, catalog])
+  const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().split('T')[0])
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isInitialized, setIsInitialized] = useState(false)
+  const [tab, setTab] = useState<'new' | 'existing'>('new')
+  // Drives the "Befintlig verifikation" picker copy: cash links against a 19xx
+  // debit, accrual against a 1510 credit.
+  const [accountingMethod, setAccountingMethod] = useState<'accrual' | 'cash'>('accrual')
+  // source_type the booking will use: drives the voucher-series preview so the
+  // number shown matches what mark-paid will actually create.
+  const [sourceType, setSourceType] =
+    useState<'invoice_cash_payment' | 'invoice_paid' | null>(null)
+  const [nextVoucher, setNextVoucher] = useState<{ series: string; next: number | null } | null>(null)
+  // The amount actually paid drives the proposed lines. Foreign-currency and
+  // ROT/RUT invoices have no share rule, so they keep the whole-invoice lines.
+  const [amountInput, setAmountInput] = useState('')
+  const [proposalSettings, setProposalSettings] = useState<ProposalSettings | null>(null)
+
+  const takesAmount = invoice.currency === 'SEK' && !hasRotRutDeduction(invoice)
+  const priorPaid = roundOre(invoice.paid_amount ?? 0)
+  const remaining = roundOre(invoice.remaining_amount ?? invoice.total - priorPaid)
+
+  const proposeLines = (
+    method: 'accrual' | 'cash',
+    settings: ProposalSettings,
+    paymentAmount: number | undefined,
+  ) =>
+    proposePaymentLines({
+      invoice: {
+        invoice_number: invoice.invoice_number,
+        total: invoice.total,
+        total_sek: invoice.total_sek,
+        subtotal: invoice.subtotal,
+        subtotal_sek: invoice.subtotal_sek,
+        vat_amount: invoice.vat_amount,
+        vat_amount_sek: invoice.vat_amount_sek,
+        currency: invoice.currency,
+        exchange_rate: invoice.exchange_rate,
+        vat_treatment: invoice.vat_treatment,
+        items: invoice.items,
+        default_dimensions: invoice.default_dimensions,
+        ore_rounding: invoice.ore_rounding,
+      },
+      accountingMethod: method,
+      entityType: settings.entityType,
+      companyOreRounding: settings.companyOreRounding,
+      paymentAmount,
+      priorPaidAmount: priorPaid,
+    })
+
+  // Load accounts and settings when dialog opens
+  useEffect(() => {
+    if (!open) {
+      setIsInitialized(false)
+      setTab('new')
+      setSourceType(null)
+      setNextVoucher(null)
+      return
+    }
+
+    let cancelled = false
+
+    async function init() {
+      try {
+        // Fetch accounts
+        const [accountsRes, fetchedCatalog] = await Promise.all([
+          fetch('/api/bookkeeping/accounts'),
+          loadBasCatalog(),
+        ])
+        if (!accountsRes.ok) throw new Error(t('load_chart_failed'))
+        const accountsData = await accountsRes.json()
+        const fetchedAccounts: BASAccount[] = accountsData.data || []
+
+        if (!company?.id) throw new Error(t('no_active_company'))
+
+        // Fetch company settings
+        const { data: settings, error: settingsError } = await supabase
+          .from('company_settings')
+          .select('accounting_method, entity_type, ore_rounding')
+          .eq('company_id', company.id)
+          .maybeSingle()
+
+        if (settingsError) throw new Error(t('load_settings_failed'))
+        if (cancelled) return
+
+        setAccounts(fetchedAccounts)
+        setCatalog(fetchedCatalog)
+
+        const accountingMethod = (settings?.accounting_method || 'accrual') as 'accrual' | 'cash'
+        const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+
+        setAccountingMethod(accountingMethod)
+
+        setSourceType(
+          resolveInvoicePaymentSourceType({
+            invoiceAlreadyBooked: !!invoice.journal_entry_id,
+            accountingMethod,
+          }),
+        )
+
+        const loadedSettings: ProposalSettings = {
+          entityType,
+          companyOreRounding:
+            typeof settings?.ore_rounding === 'boolean' ? settings.ore_rounding : undefined,
+        }
+        // Default: what is left to pay, and while nothing is paid the PDF's
+        // rounded "Att betala", so the default proposal stays the whole invoice.
+        const roundingDelta =
+          priorPaid === 0
+            ? getDisplayTotal(
+                invoice,
+                loadedSettings.companyOreRounding === undefined
+                  ? undefined
+                  : { ore_rounding: loadedSettings.companyOreRounding },
+              ).roundingDelta
+            : 0
+        const defaultAmount = takesAmount ? roundOre(remaining + roundingDelta) : undefined
+        const proposed = proposeLines(accountingMethod, loadedSettings, defaultAmount)
+
+        setProposalSettings(loadedSettings)
+        setAmountInput(defaultAmount === undefined ? '' : String(defaultAmount))
+        setLines(proposed)
+        setPaymentDate(new Date().toISOString().split('T')[0])
+        setIsInitialized(true)
+      } catch (err) {
+        if (cancelled) return
+        toast({
+          title: t('load_dialog_failed_title'),
+          description: err instanceof Error ? getErrorMessage(err) : t('try_again'),
+          variant: 'destructive',
+        })
+        onOpenChange(false)
+      }
+    }
+
+    init()
+    return () => { cancelled = true }
+  }, [open, invoice.id, company?.id])
+
+  // Voucher-series preview: resolve the upcoming serie + nummer the same way the
+  // booking engine will, so a misconfigured series is visible before confirming.
+  // Re-runs when the payment date changes (vouchers are numbered per period).
+  useEffect(() => {
+    if (!open || !sourceType) return
+    let cancelled = false
+    const qs = new URLSearchParams({ source_type: sourceType, date: paymentDate })
+    fetch(`/api/bookkeeping/voucher-sequences/next?${qs}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (cancelled || !json?.data) return
+        setNextVoucher({ series: json.data.series, next: json.data.next })
+      })
+      .catch(() => {
+        if (!cancelled) setNextVoucher(null)
+      })
+    return () => { cancelled = true }
+  }, [open, sourceType, paymentDate])
+
+  // Balance computation
+  const { totalDebit, totalCredit, isBalanced } = useMemo(() => {
+    let totalDebit = 0
+    let totalCredit = 0
+    for (const line of lines) {
+      totalDebit += parseFloat(line.debit_amount) || 0
+      totalCredit += parseFloat(line.credit_amount) || 0
+    }
+    const isBalanced = Math.round((totalDebit - totalCredit) * 100) === 0 && totalDebit > 0
+    return { totalDebit, totalCredit, isBalanced }
+  }, [lines])
+
+  const amountPlan = useMemo(() => {
+    const amount = parseFloat(amountInput)
+    if (!takesAmount || !Number.isFinite(amount) || amount <= 0) return null
+    return planCashInstalment(
+      { total: invoice.total, paid_amount: priorPaid, remaining_amount: remaining },
+      amount,
+    )
+  }, [amountInput, takesAmount, invoice.total, priorPaid, remaining])
+  // Only a payment booked under kontantmetoden can put an excess on 2420.
+  const prepaymentAllowed = sourceType === 'invoice_cash_payment'
+  const amountBlocked =
+    takesAmount &&
+    (amountPlan === null || (amountPlan.kind === 'overpayment' && !prepaymentAllowed))
+
+  const changeAmount = (value: string) => {
+    setAmountInput(value)
+    const amount = parseFloat(value)
+    if (!proposalSettings || !Number.isFinite(amount) || amount <= 0) return
+    setLines(proposeLines(accountingMethod, proposalSettings, amount))
+  }
+
+  const updateLine = (index: number, field: keyof FormLine, value: string) => {
+    setLines((prev) => {
+      const next = [...prev]
+      const updated = { ...next[index], [field]: value }
+
+      // Debit/credit exclusion: clear the other when one is entered
+      if (field === 'debit_amount' && value) {
+        updated.credit_amount = ''
+      } else if (field === 'credit_amount' && value) {
+        updated.debit_amount = ''
+      }
+
+      next[index] = updated
+      return next
+    })
+  }
+
+  const addLine = () => {
+    setLines((prev) => [...prev, { ...BLANK_LINE }])
+  }
+
+  const removeLine = (index: number) => {
+    if (lines.length <= 2) return
+    setLines((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  const handleSubmit = async () => {
+    if (!isBalanced || amountBlocked) return
+
+    setIsSubmitting(true)
+
+    try {
+      const apiLines = lines
+        .filter((l) => l.account_number && (parseFloat(l.debit_amount) || parseFloat(l.credit_amount)))
+        .map((l) => ({
+          account_number: l.account_number,
+          debit_amount: parseFloat(l.debit_amount) || 0,
+          credit_amount: parseFloat(l.credit_amount) || 0,
+          line_description: l.line_description || undefined,
+          // Dimensions PR7: the proposal re-propagates the invoice default;
+          // whatever the grid holds is what gets booked.
+          dimensions:
+            l.dimensions && Object.keys(l.dimensions).length > 0
+              ? l.dimensions
+              : undefined,
+        }))
+
+      const response = await fetch(`/api/invoices/${invoice.id}/mark-paid`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          payment_date: paymentDate,
+          lines: apiLines,
+        }),
+      })
+
+      if (!response.ok) {
+        const data = await response.json()
+        const error = new Error(t('mark_paid_failed')) as Error & { body?: unknown; status?: number }
+        error.body = data
+        error.status = response.status
+        throw error
+      }
+
+      onOpenChange(false)
+      onSuccess()
+    } catch (error) {
+      const anyErr = error as { body?: unknown; status?: number }
+      toast({
+        title: t('booking_failed_title'),
+        description: getErrorMessage(anyErr.body ?? error, { context: 'invoice', statusCode: anyErr.status }),
+        variant: 'destructive',
+      })
+    }
+
+    setIsSubmitting(false)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-[680px]">
+        <DialogHeader>
+          <DialogTitle>
+            {t('title')}{invoice.invoice_number ? t('title_suffix', { number: invoice.invoice_number }) : ''}
+            {nextVoucher && (
+              <span className="ml-1 text-muted-foreground tabular-nums">
+                ({nextVoucher.series}{nextVoucher.next})
+              </span>
+            )}
+          </DialogTitle>
+          <DialogDescription>
+            {formatCurrency(invoice.total, invoice.currency)}
+            {invoice.currency !== 'SEK' && invoice.total_sek && (
+              <>{t('description_sek_suffix', { amount: formatCurrency(invoice.total_sek) })}</>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <Tabs value={tab} onValueChange={(v) => setTab(v as 'new' | 'existing')}>
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="new">{t('tab_new_payment')}</TabsTrigger>
+            <TabsTrigger value="existing">{t('tab_existing_voucher')}</TabsTrigger>
+          </TabsList>
+          <TabsContent value="existing" className="mt-4">
+            <LinkVoucherPicker
+              invoiceId={invoice.id}
+              invoiceCurrency={invoice.currency}
+              accountingMethod={accountingMethod}
+              onLinked={() => {
+                onOpenChange(false)
+                onSuccess()
+              }}
+              onCancel={() => setTab('new')}
+            />
+          </TabsContent>
+          <TabsContent value="new" className="mt-4">
+            {!isInitialized ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+              </div>
+            ) : (
+              <div className="space-y-4">
+          {/* Payment date */}
+          <div className="space-y-1.5">
+            <Label htmlFor="payment-date">{t('payment_date_label')}</Label>
+            <Input
+              id="payment-date"
+              type="date"
+              value={paymentDate}
+              onChange={(e) => setPaymentDate(e.target.value)}
+              className="w-full sm:w-48"
+            />
+          </div>
+
+          {takesAmount && (
+            <div className="space-y-1.5">
+              <Label htmlFor="payment-amount">{t('payment_amount_label')}</Label>
+              <Input
+                id="payment-amount"
+                type="number"
+                step="0.01"
+                min="0"
+                value={amountInput}
+                onChange={(e) => changeAmount(e.target.value)}
+                className="w-full sm:w-48 tabular-nums"
+                inputMode="decimal"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('remaining_to_pay', { amount: formatCurrency(remaining, invoice.currency) })}
+                {amountPlan?.kind === 'partial' && (
+                  <> · {t('remaining_after_payment', { amount: formatCurrency(amountPlan.newRemaining, invoice.currency) })}</>
+                )}
+                {(amountPlan?.kind === 'settle' || (amountPlan?.kind === 'overpayment' && prepaymentAllowed)) && (
+                  <> · {t('settles_in_full')}</>
+                )}
+              </p>
+              {amountPlan?.kind === 'overpayment' && (
+                <p className={prepaymentAllowed ? 'text-xs text-muted-foreground' : 'text-xs text-destructive'}>
+                  {t(prepaymentAllowed ? 'overpayment_prepayment' : 'overpayment_refused', {
+                    excess: formatCurrency(amountPlan.difference, invoice.currency),
+                  })}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Journal entry lines */}
+          {/* Mobile card layout */}
+          <div className="sm:hidden space-y-3">
+            {lines.map((line, index) => (
+              <div key={index} className="rounded-lg border bg-card p-3 space-y-2">
+                <div className="flex items-start gap-2">
+                  <div className="flex-1">
+                    <AccountCombobox
+                      value={line.account_number}
+                      accounts={accounts}
+                      onChange={(val) => updateLine(index, 'account_number', val)}
+                      selectedName={accountNameByNumber.get(line.account_number)}
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 min-h-[44px] min-w-[44px] shrink-0 -mr-1 -mt-1"
+                    onClick={() => removeLine(index)}
+                    disabled={lines.length <= 2}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{t('debit_label')}</Label>
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="0,00"
+                      value={line.debit_amount}
+                      onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
+                      className="tabular-nums text-right"
+                      inputMode="decimal"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">{t('credit_label')}</Label>
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="0,00"
+                      value={line.credit_amount}
+                      onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
+                      className="tabular-nums text-right"
+                      inputMode="decimal"
+                    />
+                  </div>
+                </div>
+              </div>
+            ))}
+            <Button type="button" variant="outline" size="sm" onClick={addLine} className="w-full">
+              <Plus className="mr-1 h-3.5 w-3.5" /> {t('add_row')}
+            </Button>
+          </div>
+
+          {/* Desktop table layout */}
+          <div className="hidden sm:block space-y-2">
+            {/* Header */}
+            <div className="grid grid-cols-[1fr_120px_120px_32px] gap-2 text-xs font-medium text-muted-foreground px-1">
+              <span>{t('account_label')}</span>
+              <span className="text-right">{t('debit_label')}</span>
+              <span className="text-right">{t('credit_label')}</span>
+              <span />
+            </div>
+
+            {/* Lines */}
+            {lines.map((line, index) => (
+              <div key={index} className="grid grid-cols-[1fr_120px_120px_32px] gap-2 items-start">
+                <div className="min-w-0">
+                  <AccountCombobox
+                    value={line.account_number}
+                    accounts={accounts}
+                    onChange={(val) => updateLine(index, 'account_number', val)}
+                    selectedName={accountNameByNumber.get(line.account_number)}
+                  />
+                </div>
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  placeholder="0,00"
+                  value={line.debit_amount}
+                  onChange={(e) => updateLine(index, 'debit_amount', e.target.value)}
+                  className="tabular-nums text-right"
+                />
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  placeholder="0,00"
+                  value={line.credit_amount}
+                  onChange={(e) => updateLine(index, 'credit_amount', e.target.value)}
+                  className="tabular-nums text-right"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                  onClick={() => removeLine(index)}
+                  disabled={lines.length <= 2}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+
+            {/* Add row */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={addLine}
+              className="text-muted-foreground"
+            >
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              {t('add_row')}
+            </Button>
+          </div>
+
+          {/* Balance indicator */}
+          <div className="flex items-center justify-between border-t pt-3">
+            <div className="flex items-center gap-2">
+              {isBalanced ? (
+                <Badge variant="success">
+                  {t('balanced_badge')}
+                </Badge>
+              ) : (
+                <Badge variant="destructive">
+                  {t('unbalanced_badge', { delta: formatCurrency(Math.abs(totalDebit - totalCredit)) })}
+                </Badge>
+              )}
+            </div>
+            <div className="text-sm text-muted-foreground tabular-nums">
+              {formatCurrency(totalDebit)} / {formatCurrency(totalCredit)}
+            </div>
+          </div>
+        </div>
+            )}
+          </TabsContent>
+        </Tabs>
+
+        {tab === 'new' ? (
+          <DialogFooter>
+            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSubmitting} className="w-full sm:w-auto min-h-11">
+              {t('cancel')}
+            </Button>
+            <Button
+              onClick={handleSubmit}
+              disabled={!isBalanced || amountBlocked || isSubmitting || !isInitialized}
+              className="w-full sm:w-auto min-h-11"
+            >
+              {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {t('confirm_and_book')}
+            </Button>
+          </DialogFooter>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  )
+}
