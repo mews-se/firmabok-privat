@@ -25,6 +25,11 @@ on:
   push:
     branches: [main]
     tags: ['v*.*.*']
+  schedule:
+    # Monthly rebuild of main: same code, fresh base image and OS packages, so
+    # published images pick up security fixes between syncs. Only `latest`
+    # and the commit-sha tag move; no git tags or releases are created.
+    - cron: '40 4 3 * *'
   workflow_dispatch: {}
 
 env:
@@ -104,6 +109,12 @@ jobs:
           # OCI attestations, queryable via `docker buildx imagetools inspect`.
           provenance: mode=max
           sbom: true
+          # Scheduled and manual rebuilds exist to refresh OS packages inside
+          # otherwise unchanged layers, which a cache hit would defeat: bypass
+          # the cache for them so `apk upgrade` actually runs against today's
+          # Alpine. A manual run is how a red image scan is cleared between
+          # syncs. The refreshed layers then repopulate the cache via cache-to.
+          no-cache: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           # push-by-digest publishes without a tag; `merge` collects the digests
           # and builds the tag list from them. name-canonical records the
           # repository name in the config so the merged manifest resolves.
@@ -122,8 +133,9 @@ jobs:
           # overwrite a cache manifest describing layers the other cannot use.
           #
           # A stable cache tag is safe here: this workflow runs only on main,
-          # on v*.*.* tags (cut from main), and on manual dispatch, so there is
-          # no untrusted ref that could poison the layers.
+          # on v*.*.* tags (cut from main), on the monthly schedule (main) and
+          # on manual dispatch, so there is no untrusted ref that could poison
+          # the layers.
           #
           # image-manifest=true,oci-mediatypes=true is required by GHCR, which
           # rejects buildkit's default cache manifest media type.
