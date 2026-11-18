@@ -1,0 +1,111 @@
+'use client'
+
+import * as React from 'react'
+import Link from 'next/link'
+import { useTranslations } from 'next-intl'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import {
+  ReceiptText,
+  Users,
+  Plus,
+  type LucideIcon,
+} from 'lucide-react'
+
+interface EmptyStateProps {
+  icon?: LucideIcon
+  title: string
+  description: string
+  actionLabel?: string
+  actionHref?: string
+  onAction?: () => void
+  secondaryActionLabel?: string
+  secondaryActionHref?: string
+  className?: string
+  children?: React.ReactNode
+}
+
+/**
+ * EmptyState: friendly placeholder shown when there is no data.
+ */
+export function EmptyState({
+  icon: Icon,
+  title,
+  description,
+  actionLabel,
+  actionHref,
+  onAction,
+  secondaryActionLabel,
+  secondaryActionHref,
+  className,
+  children,
+}: EmptyStateProps) {
+  return (
+    <div className={cn('flex flex-col items-center justify-center py-12 px-4 text-center', className)}>
+      {Icon && (
+        <div className="mb-6">
+          <div className="p-4 rounded-full bg-muted">
+            <Icon className="h-8 w-8 text-muted-foreground" />
+          </div>
+        </div>
+      )}
+      <h3 className="text-lg font-medium mb-2">{title}</h3>
+      <p className="text-sm text-muted-foreground max-w-sm mb-6 text-balance">{description}</p>
+
+      {(actionLabel || children) && (
+        <div className="flex flex-col sm:flex-row items-center gap-3">
+          {actionHref && actionLabel && (
+            <Link href={actionHref}>
+              <Button>
+                <Plus className="mr-2 h-4 w-4" />
+                {actionLabel}
+              </Button>
+            </Link>
+          )}
+          {onAction && actionLabel && (
+            <Button onClick={onAction}>
+              <Plus className="mr-2 h-4 w-4" />
+              {actionLabel}
+            </Button>
+          )}
+          {secondaryActionHref && secondaryActionLabel && (
+            <Link href={secondaryActionHref}>
+              <Button variant="outline">{secondaryActionLabel}</Button>
+            </Link>
+          )}
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Preset empty states for common pages
+
+export function EmptyInvoices({ onAction }: { onAction?: () => void } = {}) {
+  const t = useTranslations('empty')
+  return (
+    <EmptyState
+      icon={ReceiptText}
+      title={t('preset_invoices_title')}
+      description={t('preset_invoices_description')}
+      actionLabel={t('preset_invoices_action')}
+      actionHref={onAction ? undefined : '/invoices?new=1'}
+      onAction={onAction}
+    />
+  )
+}
+
+export function EmptyCustomers({ onAction }: { onAction?: () => void } = {}) {
+  const t = useTranslations('empty')
+  return (
+    <EmptyState
+      icon={Users}
+      title={t('preset_customers_title')}
+      description={t('preset_customers_description')}
+      actionLabel={t('preset_customers_action')}
+      actionHref={onAction ? undefined : '/customers/new'}
+      onAction={onAction}
+    />
+  )
+}

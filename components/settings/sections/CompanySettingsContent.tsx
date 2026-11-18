@@ -1,0 +1,64 @@
+'use client'
+
+import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import { CompanyInfoForm } from '@/components/settings/CompanyInfoForm'
+import { FiscalPeriodEditor } from '@/components/settings/FiscalPeriodEditor'
+import { LogoUpload } from '@/components/settings/LogoUpload'
+import { SettingsFormWrapper } from '@/components/settings/SettingsFormWrapper'
+import { SettingsLoadError } from '@/components/settings/SettingsLoadError'
+import { SettingsLoadingSkeleton } from '@/components/settings/SettingsLoadingSkeleton'
+import { SettingsSectionHeader } from '@/components/settings/SettingsRows'
+import { useSettings } from '@/components/settings/useSettings'
+import type { CompanySettings } from '@/types'
+
+export function CompanySettingsContent() {
+  const router = useRouter()
+  const tNav = useTranslations('settings_nav')
+  const tIntro = useTranslations('settings_intro')
+  const { settings, isLoading, updateSettings, refetch } = useSettings()
+
+  if (isLoading) return <SettingsLoadingSkeleton />
+  if (!settings) return <SettingsLoadError onRetry={refetch} />
+
+  function handleSave(formData: FormData) {
+    const updates: Record<string, unknown> = {
+      ...(formData.has('company_name') && { company_name: formData.get('company_name') as string }),
+      ...(formData.has('org_number') && { org_number: formData.get('org_number') as string }),
+      address_line1: formData.get('address_line1') as string,
+      postal_code: formData.get('postal_code') as string,
+      city: formData.get('city') as string,
+      phone: (formData.get('phone') as string) || '',
+      email: (formData.get('email') as string) || '',
+      website: (formData.get('website') as string) || '',
+    }
+    return {
+      updates,
+      onSuccess: (data: Record<string, unknown>) => {
+        updateSettings(data as Partial<CompanySettings>)
+        // Refresh server components so DashboardNav picks up the new
+        // company_name (rendered from server in the dashboard layout).
+        if ('company_name' in updates) {
+          router.refresh()
+        }
+      },
+    }
+  }
+
+  return (
+    <div>
+      <SettingsSectionHeader title={tNav('company')} intro={tIntro('company')} />
+
+      <SettingsFormWrapper onSave={handleSave}>
+        <CompanyInfoForm settings={settings} />
+      </SettingsFormWrapper>
+
+      <LogoUpload
+        logoUrl={settings.logo_url}
+        onUpdate={(url) => updateSettings({ logo_url: url })}
+      />
+
+      <FiscalPeriodEditor />
+    </div>
+  )
+}
